@@ -15,13 +15,14 @@ import {
     VoiceConnection, 
     VoiceConnectionStatus 
 } from '@discordjs/voice';
-import { Interaction, Client, GuildMember, CommandInteraction, UserFlags } from 'discord.js';
-import { getInfo } from 'ytdl-core';
-import playdl from 'play-dl';
+import { Interaction, Client, GuildMember, CommandInteraction } from 'discord.js';
+import playdl, { YouTubeVideo } from 'play-dl';
 import dotenv from 'dotenv';
 
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {};
+const DISPLAY_QUEUE_MAX = 20;
+const VOLUME_LOGARITHMIC = 0.5;
 
 /**
  * A SoundsmithConnection exists for each active VoiceConnection. Each connection has its own 
@@ -71,30 +72,46 @@ class SoundsmithConnection {
     
     public enqueueStart(track: SoundObject) {
         this.queue.unshift(track);
+        this.skipTrack();
         void this.processQueue();
     }
 
+    public enqueueShuffled(track: SoundObject) {
+        // Pick a random spot to enqueue a shuffled item. Bias to pick the further of two random positions,
+        // reducing the chance that a track plays multiple times in quick succession.
+        const rand1 = Math.floor(Math.random() * (this.queue.length + 1));
+        const rand2 = Math.floor(Math.random() * (this.queue.length + 1));
+        const higher = Math.max(rand1, rand2);
+        console.log(`Shuffle inserting track into position: ${higher}`);
+        
+        this.queue.splice(higher, 0, track);
+    }
+
+    /**
+     * Skip functions. Skips can be done on a single track, multiple tracks, or a range of tracks.
+     */
     public skipTrack() {
         // Calling .stop() on an AudioPlayer causes it to transition into the Idle state. Because of a state transition
         // listener defined, transitions into the Idle state mean the next track from the queue will be loaded and played.
         this.skippedSong = true;
         this.audioPlayer.stop();
     }
-
     public skipMultipleTracks(numTracks: number) {
-        if (numTracks > 1) {
-            // Remove n-1 tracks and then use stop() to skip to the desired track.
+        // Remove n-1 tracks from the queue and then use stop() to finally skip to the desired track.
+        if (numTracks > 1) 
             this.queue.splice(0, numTracks - 1);
-        }
         this.skippedSong = true;
         this.audioPlayer.stop();
     }
-
     public skipRangeTracks(skipStart: number, skipEnd: number) {
-        if (skipStart === 0) {
+        // Subtract 1 from start (since the queue visually indexes from 1). Don't subtract from the end since ranges are inclusive.
+        skipStart -= 1; 
+        if (skipStart === 0) 
             this.skipMultipleTracks(skipEnd);
-        } else if (skipStart < skipEnd) {
-            this.queue.splice(skipStart, skipEnd);
+        else if (skipStart < skipEnd) {
+            for (let i = skipStart; i < skipEnd; i++) { console.log(`Skipping track #${i+1}: ${this.queue[i].title}`); }
+
+            this.queue.splice(skipStart, skipEnd - skipStart);
         }
     }
 
@@ -110,7 +127,7 @@ class SoundsmithConnection {
         if (flag) 
             this.shuffleQueue();
 
-        this.playbackFlags.loop = flag;
+        this.playbackFlags.shuffle = flag;
         return flag;
     }
 
@@ -121,6 +138,7 @@ class SoundsmithConnection {
             [this.queue[i], this.queue[j]] = [this.queue[j], this.queue[i]];
         }
     }
+
     /**
      * Stops audio playback and empties the queue.
      */
@@ -130,72 +148,54 @@ class SoundsmithConnection {
         this.audioPlayer.stop(true);
     }
 
+    public getQueueLength() {
+        let totalTimeSeconds = 0;
+        this.queue.forEach((entry) => totalTimeSeconds += entry.lengthSeconds);
+        return calcTimeHMS(totalTimeSeconds);
+    }
+
     /**
      * Attempts to play a SoundObject from the queue.
      */
     private async processQueue(): Promise<void> {
-        //console.log(`Status: ${this.audioPlayer.state.status}, CurrentObject: ${this.currentObject?.title}, Flags (L,R,S): ${[this.playbackFlags.loop, this.playbackFlags.repeat, this.playbackFlags.shuffle]}`)
-
         // Return if the queue is locked (already being processed), or the audio player is already playing something
-        if (this.queueLock || this.audioPlayer.state.status !== AudioPlayerStatus.Idle) {
+        if (this.queueLock || this.audioPlayer.state.status !== AudioPlayerStatus.Idle) 
             return;
-        }
-
+        
         // Return if the queue is empty and there's no repeating or looping track.
-        if (this.queue.length === 0 && (!this.currentObject || !(this.playbackFlags.loop || this.playbackFlags.repeat))) {
+        if (this.queue.length === 0 && (!this.currentObject || !(this.playbackFlags.loop || this.playbackFlags.repeat))) 
             return;
-        }
-
-        // Lock the queue to guarantee safe access
-        this.queueLock = true;
-
-        // if (this.skippedSong) {
-        //     this.skippedSong = false;
-        // } else {
-        //     if (this.playbackFlags.repeat && this.currentObject) {
-        //         this.currentObject.onStart = noop;
-        //         console.log(`Repeating song: ${this.currentObject.title}`);
-        //     }
-        //     else if (this.playbackFlags.loop && this.currentObject) {
-        //         // Add the current track back to the end if we're looping the queue. 
-        //         this.currentObject.onStart = noop;
-        //         this.queue.unshift(this.currentObject);
-        //     }
-        // }
-
-        // Use the previous object as the current object if repeating or if looping a single-track queue. Ignore this part if the last song was skipped.
-        // Take the first item from the queue. This is guaranteed to exist, due to the non-empty check above.
+        
+        this.queueLock = true; // Lock the queue to guarantee safe access
 
         let nextTrack: SoundObject;
-
+        // Use the previous object as the current object if repeating or if looping a single-track queue.
+        // Ignore this part if the last song was skipped.
         if (!this.skippedSong && this.currentObject && (this.playbackFlags.repeat || (this.queue.length === 0 && this.playbackFlags.loop))) {
-            nextTrack = this.currentObject.clearOnStart();
+            nextTrack = this.currentObject;
         } else {
+            // Take the first item from the queue. This is guaranteed to exist, due to the non-empty check above.
             nextTrack = this.queue.shift()!;
 
             if (this.playbackFlags.loop && this.currentObject) {
-                this.enqueue(this.currentObject);
+                // Add the track back to a random position in the queue (biased toward further locations) if shuffle is enabled.
+                this.playbackFlags.shuffle ? this.enqueueShuffled(this.currentObject) : this.enqueue(this.currentObject);
                 console.log(`Adding song to the end: ${this.currentObject.title}`);
             }
         }
-
-        // const nextTrack = (!this.skippedSong && this.currentObject && (this.playbackFlags.repeat || (this.queue.length === 0 && this.playbackFlags.loop))) 
-        //     ? this.currentObject.clearOnStart() 
-        //     : this.queue.shift()!;
-
         this.skippedSong = false;
 
         try {
-            // Attempt to convert the Track into an AudioResource (i.e., start to stream the video)
             const resource = await nextTrack.createAudioResource();
-            resource.volume?.setVolumeLogarithmic(0.5);
-            console.log(`Playing audio resource: ${nextTrack.title}`);
+            resource.volume?.setVolumeLogarithmic(VOLUME_LOGARITHMIC);
+            console.log(` * Now playing audio resource: ${nextTrack.title}`);
 
-            this.currentObject = nextTrack; // Keep track of the currently playing object for loops
+            // Keep track of the currently playing object for loops and repeats.
+            this.currentObject = nextTrack; 
             this.audioPlayer.play(resource);
             this.queueLock = false;
         } catch (error) {
-            // If an error occurred, play the next item of the queue instead.
+            // If an error occurred, try to play the next item of the queue instead.
             nextTrack.onError(error as Error);
             this.queueLock = false;
             return this.processQueue();
@@ -206,7 +206,7 @@ class SoundsmithConnection {
 interface SoundObjectData {
     url: string;
     title: string;
-    length: string;
+    lengthSeconds: number;
     user: string;
     onStart: () => void;
     onFinish: () => void;
@@ -225,16 +225,16 @@ interface SoundObjectData {
 class SoundObject implements SoundObjectData {
     public readonly url: string;
     public readonly title: string;
-    public readonly length: string;
+    public readonly lengthSeconds: number;
     public readonly user: string;
     public onStart: () => void;
     public readonly onFinish: () => void;
     public readonly onError: (error: Error) => void;
 
-    private constructor({ url, title, length, user, onStart, onFinish, onError}: SoundObjectData) {
+    private constructor({ url, title, lengthSeconds, user, onStart, onFinish, onError}: SoundObjectData) {
         this.url = url;
         this.title = title;
-        this.length = length;
+        this.lengthSeconds = lengthSeconds;
         this.user = user;
         this.onStart = onStart;
         this.onFinish = onFinish;
@@ -246,40 +246,20 @@ class SoundObject implements SoundObjectData {
         return createAudioResource(source.stream, { metadata: this, inputType: source.type, inlineVolume: true });
     }
 
-    /**
-     * Remove the on-start reply trigger to the original command when starting the track.
-     * This is called for when a track is looped or repeated, which doesn't need an acknowledgement/reply every time.
-     */
-    public clearOnStart() {
-        this.onStart = noop;
-        return this;
-    }
-
     public getTimeHMS() {
-        let lengthSeconds = parseInt(this.length);
-        let hours = Math.floor(lengthSeconds / 3600);
-        let minutes = Math.floor((lengthSeconds - (hours * 3600)) / 60);
-        let seconds = lengthSeconds - (hours * 3600) - (minutes * 60);
-
-        let strHours = hours.toString();
-        let strMinutes = minutes.toString();
-        let strSeconds = seconds.toString();
-        if (hours < 10) { strHours = "0" + strHours; }
-        if (minutes < 10) { strMinutes = "0" + strMinutes; }
-        if (seconds < 10) { strSeconds = "0" + strSeconds; }
-        return `${ hours > 0 ? strHours + ":" : ""}${strMinutes}:${strSeconds}`;
+        return calcTimeHMS(this.lengthSeconds);
     }
 
     /**
      * Creates a SoundObject from a video URL and lifecycle callback methods.
      * 
-     * @param url the URL of the video
+     * @param info The video info
+     * @param user The user who added this sound
      * @param methods Lifecycle callbacks
      * 
      * @returns the created track
      */
-     public static async from(url: string, user: string, methods: Pick<SoundObject, 'onStart' | 'onFinish' | 'onError'>): Promise<SoundObject> {
-        const info = await getInfo(url);
+     public static async from(info: YouTubeVideo, user: string, methods: Pick<SoundObject, 'onStart' | 'onFinish' | 'onError'>): Promise<SoundObject> {
 
         // The methods are wrapped so that we can ensure that they are only called once.
         const wrappedMethods = {
@@ -298,10 +278,10 @@ class SoundObject implements SoundObjectData {
         };
 
         return new SoundObject({
-            title: info.videoDetails.title,
-            length: info.videoDetails.lengthSeconds,
+            title: info.title? info.title : "Untitled",
+            lengthSeconds: info.durationInSec,
             user: user,
-            url, 
+            url: info.url, 
             ...wrappedMethods,
         });
     }
@@ -333,6 +313,13 @@ client.on('messageCreate', async (message) => {
                         type: 'STRING' as const,
                         description: 'The URL of the song to play',
                         required: true,
+                    },
+                    {
+                        name: 'now',
+                        type: 'STRING' as const,
+                        description: 'Cut the queue and play this track now?',
+                        required: false,
+                        choices: [ { name: 'yes', value: 'yes', }, { name: 'no', value: 'no', }]
                     },
                 ], 
             },
@@ -396,35 +383,17 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     if (!interaction.isCommand() || !interaction.guildId) return;
     let soundsmithConnection = voiceConnections.get(interaction.guildId);
 
-    if (interaction.commandName === 'play') {
-        commandPlay(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'skip') {
-        commandSkip(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'queue') {
-        commandQueue(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'pause') {
-        commandPause(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'resume') {
-        commandResume(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'leave') {
-        commandLeave(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'loop') {
-        commandLoop(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'shuffle') {
-        commandShuffle(interaction, soundsmithConnection);
-
-    } else if (interaction.commandName === 'repeat') {
-        commandRepeat(interaction, soundsmithConnection);
-
-    } else {
-        await interaction.reply('Unknown command');
+    switch(interaction.commandName) {
+        case 'play':    commandPlay(interaction, soundsmithConnection);    break;
+        case 'skip':    commandSkip(interaction, soundsmithConnection);    break;
+        case 'queue':   commandQueue(interaction, soundsmithConnection);   break;
+        case 'pause':   commandPause(interaction, soundsmithConnection);   break;
+        case 'resume':  commandResume(interaction, soundsmithConnection);  break;
+        case 'leave':   commandLeave(interaction, soundsmithConnection);   break;
+        case 'loop':    commandLoop(interaction, soundsmithConnection);    break;
+        case 'shuffle': commandShuffle(interaction, soundsmithConnection); break;
+        case 'repeat':  commandRepeat(interaction, soundsmithConnection);  break;
+        default: await interaction.reply('Unknown command');
     }
 })
 
@@ -432,16 +401,22 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
 /**
  * Play a song from YouTube (standard). Needs to join a voice chat, which needs the user to be in one.
+ * 
+ * URLs can be either for a single YouTube video or for a playlist. URLs that include playlists will
+ * default to loading the playlist contents into the queue.
  */
 async function commandPlay(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     await interaction.deferReply();
 
     // Extract the video URL from the command
     const url = interaction.options.get('url')!.value! as string;
+    const now = interaction.options.get('now')?.value
+    const enqueueAtStart = now && now === "yes";
+
     const user = interaction.user.username;
 
     // Join the user's voice channel if they are in one. 
-    if (!soundsmithConnection) {
+    if (!soundsmithConnection) 
         if (interaction.member instanceof GuildMember && interaction.member.voice.channel) {
             let userChannel = interaction.member.voice.channel;
 
@@ -456,8 +431,7 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
             soundsmithConnection.voiceConnection.on('error', console.warn);
             voiceConnections.set(interaction.guildId, soundsmithConnection);
         }
-    }
-
+    
     // Tell the user to join a channel if they are not in one. 
     if (!soundsmithConnection) {
         await interaction.followUp('You must be in a voice channel first!');
@@ -473,28 +447,74 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
         return;
     }
 
-    // Attempt to create a SoundObject from the user's video URL.
-    try {
-        const soundObject = await SoundObject.from(url, user, {
-            onStart() { },  //interaction.followUp({ content: `Now playing: ${soundObject.title}`, ephemeral: true }).catch(console.warn) }, // Spammy
-            onFinish() { }, // Finish silently to reduce spam
-            onError(error: any) {
-                console.warn(error);
-                interaction.followUp({ content: `Error: ${error.message}`, ephemeral: true }).catch(console.warn);
-            },
-        })
+    // Check if the URL is a playlist.
+    const listMatch = url.match(/^.*list=([^#\&\?]*).*/);
+    if (listMatch && listMatch.length === 2 && listMatch[1].length > 0) {
+        // Attempt to create multiple SoundObjects if the url is a playlist.
+        try {
+            const playlistId = listMatch[1];
+            console.log(`Processing playlist id: ${playlistId}`);
+            const playlist = await playdl.playlist_info(playlistId, { incomplete: true });
+            
+            if (playlist) {
+                let videos = await playlist.all_videos();
+                videos.forEach(video => { console.log(`Added track: ${video.title}, url: ${video.url} `) });
 
-        // Enqueue the track, and reply a success message to the user.
-        soundsmithConnection.enqueue(soundObject);
-        await interaction.followUp(`**${soundObject.title}** has been added to the queue.`);
+                // Create SoundObjects for every video retrievable from the playlist.
+                for (let i = 0; i < videos.length; i++) {
+                    const soundObject = await SoundObject.from(videos[i], user, {
+                        onStart() { },
+                        onFinish() { },
+                        onError(error: any) {
+                            console.warn(error);
+                            interaction.followUp({ content: `Error: ${error.message}`, ephemeral: true }).catch(console.warn);
+                        },
+                    })
+                    // Enqueue the track.
+                    enqueueAtStart ? soundsmithConnection.enqueueStart(soundObject) : soundsmithConnection.enqueue(soundObject);
+                }
+                interaction.followUp({ content: `${videos.length} tracks have been added to the ${enqueueAtStart ? "front of the" : ""} queue.`});
+            } else {
+                console.log('No videos found in playlist, or invalid YouTube playlist.');
+                interaction.followUp({ content: 'No videos found in playlist, or invalid YouTube playlist.'});
+            }
+        } catch (error) {
+            console.warn(error);
+            await interaction.followUp(`Could not load playlist from the url: ${url}. Please verify the link is correct, or try again later.`);
+        }
+    } else {
+        // Assume the url given is for a single video, since it is not a playlist.
+        // Attempt to create a SoundObject from the user's video URL.
+        try {
+            const info = await playdl.video_info(url);
+            const soundObject = await SoundObject.from(info.video_details, user, {
+                onStart() { },  
+                onFinish() { }, // Finish silently to reduce spam
+                onError(error: any) {
+                    console.warn(error);
+                    interaction.followUp({ content: `Error: ${error.message}`, ephemeral: true }).catch(console.warn);
+                },
+            })
 
-    // Something went wrong.
-    } catch (error) {
-        console.warn(error);
-        await interaction.followUp(`Could not play the url: ${url}. Please verify the link is correct, or try again later.`);
+            // Enqueue the track, and reply a success message to the user.
+            enqueueAtStart ? soundsmithConnection.enqueueStart(soundObject) : soundsmithConnection.enqueue(soundObject);
+            await interaction.followUp(`**${soundObject.title}** has been added to the ${enqueueAtStart ? "front of the" : ""}queue.`);
+
+        // Something went wrong.
+        } catch (error) {
+            console.warn(error);
+            await interaction.followUp(`Could not play the url: ${url}. Please verify the link is correct, or try again later.`);
+        }
     }
 }
 
+/**
+ * Skip track(s) in the Soundsmith queue.
+ * Depends on user input. 
+ *  - When given no parameters, skip the currently-playing track.
+ *  - When given a single number, skip that many tracks, starting from the current track.
+ *  - When given a range of numbers, remove that range of track numbers from the queue.
+ */
 async function commandSkip(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         const interactionOptions = interaction.options.get('target');
@@ -524,14 +544,10 @@ async function commandSkip(interaction: CommandInteraction, soundsmithConnection
             let first = parseInt(range[1]);
             let second = parseInt(range[2]);
             let lower = Math.max(1, Math.min(first, second, soundsmithConnection.queue.length));
-            let higher = Math.min(soundsmithConnection.queue.length, Math.max(first, second, soundsmithConnection.queue.length));
+            let higher = Math.min(soundsmithConnection.queue.length, Math.max(first, second, 1));
             soundsmithConnection.skipRangeTracks(lower, higher);
     
-            if (lower < higher) {
-                await interaction.reply(`Skipped tracks: ${lower}-${higher}.`);
-            } else if (lower === higher) {
-                await interaction.reply(`Skipped track #${lower}.`);
-            }
+            interaction.reply(`Skipped track${lower < higher ? `s: ${lower}-${higher}` : ` #${lower}`}.`);
             return;
         }
         // Parse input to skip n tracks (from the current).
@@ -546,86 +562,117 @@ async function commandSkip(interaction: CommandInteraction, soundsmithConnection
             await interaction.reply('Please enter a positive number of tracks to skip.');
             return;
         }
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Display the current queue of tracks.
+ * Shows the length of each track and the total length of the remaining queue.
+ */
 async function commandQueue(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
-    // Print out the current queue (up to 20).
     if (soundsmithConnection) {
-        const current = soundsmithConnection.audioPlayer.state.status === AudioPlayerStatus.Idle
-            ? `Nothing is currently playing!`
-            : `Playing **${(soundsmithConnection.audioPlayer.state.resource as AudioResource<SoundObject>).metadata.title}**`;
+        let current: string;
+        if (soundsmithConnection.audioPlayer.state.status === AudioPlayerStatus.Idle)
+            current = `Nothing is currently playing!`
+        else {
+            const playerInfo = (soundsmithConnection.audioPlayer.state.resource as AudioResource<SoundObject>);
+            const metadata = playerInfo.metadata;
+            current = `:arrow_forward: **\`[${calcTimeHMS(Math.floor(playerInfo.playbackDuration / 1000))} / ${metadata.getTimeHMS()}]\`** **__${metadata.title}__**  *added by ${metadata.user}*`;
+        }
         
-        const queue = soundsmithConnection.queue
-            .slice(0, 20)
-            .map((song, index) => `${index + 1}. [${song.getTimeHMS()}] **${song.title}** Added by **${song.user}**`)
+        let queue = soundsmithConnection.queue
+            .slice(0, DISPLAY_QUEUE_MAX)
+            .map((song, index) => `\`${index + 1}.\` \`${song.getTimeHMS()}\` *${song.user}:*  ${song.title}`)
             .join('\n');
-
-        await interaction.reply(`${current}\n\n${queue}`);
-    } else {
+        if (soundsmithConnection.queue.length > DISPLAY_QUEUE_MAX)
+            queue = `${queue}\n\n...And ${soundsmithConnection.queue.length - DISPLAY_QUEUE_MAX} more tracks...`;
+        
+        await interaction.reply(`${current}\n${queue}\n**${soundsmithConnection.getQueueLength()}** total of queued tracks remaining.`);
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Pause playback.
+ */
 async function commandPause(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         soundsmithConnection.audioPlayer.pause();
         await interaction.reply({ content: `Paused!`, ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Resume playback.
+ */
 async function commandResume(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         soundsmithConnection.audioPlayer.unpause();
         await interaction.reply({ content: `Unpaused!`, ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Cancel all sound and exit the voice channel.
+ */
 async function commandLeave(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         soundsmithConnection.voiceConnection.destroy();
         voiceConnections.delete(interaction.guildId);
         await interaction.reply({ content: `Goodbye world!`, ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Set the audio player's Loop flag.
+ */
 async function commandLoop(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         const choice = interaction.options.get('flag')!.value! as string;
         console.log(`Loop: ${choice}`);
-
         await interaction.reply({ content: soundsmithConnection.setFlagLoop(choice === "on") ? "Loop enabled!" : "Loop disabled!", ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Set the audio player's Repeat flag.
+ */
 async function commandRepeat(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         const choice = interaction.options.get('flag')!.value! as string;
         console.log(`Repeat: ${choice}`);
-
         await interaction.reply({ content: soundsmithConnection.setFlagRepeat(choice === "on") ? "Repeat enabled!" : "Repeat disabled!", ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
 }
 
+/**
+ * Set the audio player's Shuffle flag.
+ */
 async function commandShuffle(interaction: CommandInteraction, soundsmithConnection: SoundsmithConnection) {
     if (soundsmithConnection) {
         const choice = interaction.options.get('flag')!.value! as string;
-        console.log(`Repeat: ${choice}`);
-
+        console.log(`Shuffle: ${choice}`);
         await interaction.reply({ content: soundsmithConnection.setFlagShuffle(choice === "on") ? "Shuffle enabled!" : "Shuffle disabled!", ephemeral: true });
-    } else {
+    } else 
         await interaction.reply('Not playing in this server!');
-    }
+}
+
+// Helpers
+function calcTimeHMS(lengthSeconds: number) {
+    let hours = Math.floor(lengthSeconds / 3600);
+    let minutes = Math.floor((lengthSeconds - (hours * 3600)) / 60);
+    let seconds = lengthSeconds - (hours * 3600) - (minutes * 60);
+
+    let strHours = hours.toString();
+    let strMinutes = minutes.toString();
+    let strSeconds = seconds.toString();
+    if (hours > 0 && minutes < 10) { strMinutes = "0" + strMinutes; }
+    if (seconds < 10) { strSeconds = "0" + strSeconds; }
+    return `${ hours > 0 ? strHours + ":" : ""}${strMinutes}:${strSeconds}`;
 }

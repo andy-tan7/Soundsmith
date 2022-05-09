@@ -21,7 +21,7 @@ import dotenv from 'dotenv';
 
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {};
-const DISPLAY_QUEUE_MAX = 20;
+const DISPLAY_QUEUE_MAX_LENGTH = 1800;
 const VOLUME_LOGARITHMIC = 0.5;
 
 /**
@@ -48,7 +48,7 @@ class SoundsmithConnection {
         // Configure the audio player
         this.audioPlayer.on('stateChange', (oldState: any, newState: any) => {
             if (newState?.status === AudioPlayerStatus.Idle && oldState.status !== AudioPlayerStatus.Idle) {
-                // Non-idle becoming Idle means the previous audio resource has finished playing. 
+                // Non-idle becoming Idle means the previous audio resource has finished playing.
 				// The queue is then processed to start playing the next track, if one is available.
                 (oldState.resource as AudioResource<SoundObject>).metadata.onFinish();
                 void this.processQueue();
@@ -76,6 +76,7 @@ class SoundsmithConnection {
     public enqueueStart(track: SoundObject) {
         this.queue.unshift(track);
         this.skipTrack();
+        this.audioPlayer.unpause();
         void this.processQueue();
     }
 
@@ -96,7 +97,7 @@ class SoundsmithConnection {
      * Clear the queue and skip the current track. 
      */
     public stopQueue(): boolean {
-        if (this.queue.length === 0)
+        if (this.queue.length === 0 && this.audioPlayer.state.status === AudioPlayerStatus.Idle)
             return false;
 
         this.queue.length = 0;
@@ -176,7 +177,6 @@ class SoundsmithConnection {
      * Stops audio playback and empties the queue.
      */
     public stop() {
-        this.queueLock = true;
         this.queue = [];
         this.audioPlayer.stop(true);
     }
@@ -191,6 +191,7 @@ class SoundsmithConnection {
      * Attempts to play a SoundObject from the queue.
      */
     private async processQueue(): Promise<void> {
+        console.log(`Queue lock: ${this.queueLock}`);
         // Return if the queue is locked (already being processed), or the audio player is already playing something
         if (this.queueLock || this.audioPlayer.state.status !== AudioPlayerStatus.Idle) 
             return;
@@ -404,7 +405,9 @@ client.on('messageCreate', async (message) => {
                     },
                 ],
             },
-            generateAmbientOptions(),
+            generateAmbientCommandWithOptions('ambient_area', '(Default) Select a preset ambient area sound to play', RESOURCE_AREA),
+            generateAmbientCommandWithOptions('ambient_climate', 'Select a preset ambient climate sound to play', RESOURCE_CLIMATE),
+            generateAmbientCommandWithOptions('ambient_urban', 'Select a preset ambient urban sound to play', RESOURCE_URBAN),
         ]);
 
         await message.reply('Deployed!');
@@ -429,7 +432,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         case 'loop':    commandLoop(interaction, soundsmithConnection);    break;
         case 'shuffle': commandShuffle(interaction, soundsmithConnection); break;
         case 'repeat':  commandRepeat(interaction, soundsmithConnection);  break;
-        case 'ambient': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_area': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_urban': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_climate': commandAmbient(interaction, soundsmithConnection); break;
         default: await interaction.reply({ content: 'Unknown command', ephemeral: true});
     }
 })
@@ -518,7 +523,7 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
 
             // Enqueue the track, and reply a success message to the user.
             enqueueObject(soundsmithConnection, soundObject, enqueueAtStart);
-            await interaction.followUp(`**${soundObject.title}** has been added to the ${enqueueAtStart ? "front of the" : ""} queue.`);
+            await interaction.followUp(`[**${soundObject.title}**](<${soundObject.url}>) has been added to the ${enqueueAtStart ? "front of the " : ""}queue.`);
 
         // Something went wrong.
         } catch (error) {
@@ -560,8 +565,8 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
             soundsmithConnection.stopQueue();
         }
         
-        soundsmithConnection.enqueueStart(soundObject)
-        await interaction.followUp(`Playing ambient track: **${soundObject.title}**`);
+        soundsmithConnection.enqueueStart(soundObject);
+        await interaction.followUp(`Playing ambient track: [**${soundObject.title}**](<${soundObject.url}>)`);
 
     // Something went wrong.
     } catch (error) {
@@ -657,17 +662,26 @@ async function commandQueue(interaction: CommandInteraction, soundsmithConnectio
         else {
             const playerInfo = (soundsmithConnection.audioPlayer.state.resource as AudioResource<SoundObject>);
             const metadata = playerInfo.metadata;
-            current = `:arrow_forward: **\`[${calcTimeHMS(Math.floor(playerInfo.playbackDuration / 1000))} / ${metadata.getTimeHMS()}]\`** **__${metadata.title}__**  *added by ${metadata.user}*`;
+            current = `:arrow_forward: **\`[${calcTimeHMS(Math.floor(playerInfo.playbackDuration / 1000))} / ${metadata.getTimeHMS()}]\`** [**__${metadata.title}__**](<${metadata.url}>)  *added by ${metadata.user}*`;
         }
         
-        let queue = soundsmithConnection.queue
-            .slice(0, DISPLAY_QUEUE_MAX)
-            .map((song, index) => `\`${index + 1}.\` \`${song.getTimeHMS()}\` *${song.user}:*  ${song.title}`)
-            .join('\n');
-        if (soundsmithConnection.queue.length > DISPLAY_QUEUE_MAX)
-            queue = `${queue}\n\n...And ${soundsmithConnection.queue.length - DISPLAY_QUEUE_MAX} more tracks...`;
+        const maxQueueLength = DISPLAY_QUEUE_MAX_LENGTH - current.length;
+        let queueText: string = "";
+        let songIndex = 0;
+        for (songIndex; songIndex < soundsmithConnection.queue.length; songIndex++) {
+            let song = soundsmithConnection.queue[songIndex];
+            let entry = `\n\`${songIndex + 1}.\` \`${song.getTimeHMS()}\` *${song.user}:*  ${song.title}`;
+
+            if (queueText.length + entry.length > maxQueueLength) {
+                break;
+            }
+            queueText += entry;
+        }
+        if (songIndex < soundsmithConnection.queue.length) {
+            queueText += `\n\n...And ${soundsmithConnection.queue.length - songIndex} more tracks...`;
+        }
         
-        await interaction.reply(`${current}\n${queue}\n**${soundsmithConnection.getQueueLength()}** total of queued tracks remaining.`);
+        await interaction.reply(`${current}\n${queueText}\n**${soundsmithConnection.getQueueLength()}** total of queued tracks remaining.`);
     } else 
         await interaction.reply({ content: 'Soundsmith is not playing in this server!', ephemeral: true});
 }
@@ -843,15 +857,15 @@ async function userInVoiceAndConnectionStable(interaction: CommandInteraction, s
 }
 
 /**
- * @returns The array of preset ambient song options based on AMBIENT_RESOURCE.
+ * @returns The array of preset ambient song options based on the resources.
  */
-function generateAmbientOptions(): ApplicationCommandData {
+function generateAmbientCommandWithOptions(commandName: string, commandDescription: string, resource: {name: string, url: string, description: string}[]) {
     let stageOptions: ApplicationCommandOptionChoice[] = [];
-    AMBIENT_RESOURCE.forEach(resource => {
-        stageOptions.push({name: resource.name, value: resource.url});
+    resource.forEach(r => {
+        stageOptions.push({name: r.name, value: r.url});
     })
 
-    return { name: 'ambient', description: 'Select a preset ambient sound to play.', options: [
+    return { name: commandName, description: commandDescription, options: [
         {
             name: 'name',
             type: 'STRING' as const,
@@ -869,32 +883,55 @@ function generateAmbientOptions(): ApplicationCommandData {
     ]};
 }
 
-const AMBIENT_RESOURCE = [ // This list is limited to 25 due to Discord API limitations. I may add other commands in the future.
-    { name: 'blacksmith',   url: 'https://www.youtube.com/watch?v=lxKVT1r4sgU', description: 'Ambient bellows'},
+// This list is limited to 25 due to Discord API limitations. I may add other commands in the future.
+const RESOURCE_AREA = [ 
+    { name: 'catacombs',    url: 'https://www.youtube.com/watch?v=WPpVMmTt74Q', description: 'Eerie echoes of shadows between old tombs'},
     { name: 'camp_night',   url: 'https://www.youtube.com/watch?v=LYF2VzCN0os', description: 'Cozy camp in the eerie night'},
-    { name: 'camp_war',     url: 'https://www.youtube.com/watch?v=QP0hRjF4d6k', description: 'Sharpening blades and war preparations'},
-    { name: 'city_crowd',   url: 'https://www.youtube.com/watch?v=_52K0E_gNY0', description: 'Loud, crowded medieval city'},
-    { name: 'city_night',   url: 'https://www.youtube.com/watch?v=FvgV3G-EnnQ', description: 'Evening in the city'},
     { name: 'countryside',  url: 'https://www.youtube.com/watch?v=wEEc9RhHTzU', description: 'Calm countryside with animal sounds'},
     { name: 'cult_temple',  url: 'https://www.youtube.com/watch?v=UxOLopND4CA', description: 'Echoes and distant, evil chants'},
     { name: 'darkness',     url: 'https://www.youtube.com/watch?v=EUtE1k0VXKI', description: 'Echoes of the ruins below'},
+    { name: 'dark_swamp',   url: 'https://www.youtube.com/watch?v=NQIoLiQ_uNU', description: 'Spooky ambience of a swamp'},
     { name: 'deserted',     url: 'https://www.youtube.com/watch?v=2FpLYU8HoIo', description: 'The hollow remains of a ghost town'},
     { name: 'dungeon',      url: 'https://www.youtube.com/watch?v=wScEFaoqwPM', description: 'Cavernous hollows'},
-    //{ name: 'forest_birds', url: 'https://www.youtube.com/watch?v=xNN7iTA57jM', description: 'Peaceful woodlands'},
+    { name: 'forest_birds', url: 'https://www.youtube.com/watch?v=xNN7iTA57jM', description: 'Peaceful woodlands'},
     { name: 'forest_eerie', url: 'https://www.youtube.com/watch?v=QQg0br-eZUg', description: 'Uneasy woods'},
-    { name: 'forest_wind',  url: 'https://www.youtube.com/watch?v=7WPsftkv1ZY', description: 'Soothing forest winds'},
-    { name: 'hellish',      url: 'https://www.youtube.com/watch?v=JzVIkY5tKcE', description: 'Evil and haunting screams'},
-    { name: 'library',      url: 'https://www.youtube.com/watch?v=VvC12NAf-Cw', description: 'Quiet library'},
-    { name: 'mountain_wind', url: 'https://www.youtube.com/watch?v=oy0jX_I1CIU', description: 'Heavy, stable winds'},
+    { name: 'haunted_night', url: 'https://www.youtube.com/watch?v=58dAcjgtfbk', description: 'Spooky ghost sounds and crows'},
+    { name: 'mines',        url: 'https://www.youtube.com/watch?v=F41CoM8gIqA', description: 'Echoing caves, pickaxes and mines'},
     { name: 'ocean_cave',   url: 'https://www.youtube.com/watch?v=Z-pbILkmhMk', description: 'Cave by the ocean'},
     { name: 'ocean_shore',  url: 'https://www.youtube.com/watch?v=WcqURB6_E5I', description: 'Waves crash into jagged cliffs'},
-    { name: 'rain',         url: 'https://www.youtube.com/watch?v=Mr9T-943BnE', description: 'Persistent showers'},
-    { name: 'river',        url: 'https://www.youtube.com/watch?v=lR4GNWcwAI8', description: 'Down by the creek'},
-    { name: 'storm_light',  url: 'https://www.youtube.com/watch?v=2wqf6nvML7Y', description: 'Mild thunderstorm'},
-    //{ name: 'storm_heavy',  url: 'https://www.youtube.com/watch?v=KQ8MajN-61Q', description: 'Severe thunderstorm'},
+    { name: 'plains_morning', url: 'https://www.youtube.com/watch?v=q89BgsmHFMc', description: 'Morning birds'},
+    { name: 'river',        url: 'https://www.youtube.com/watch?v=lR4GNWcwAI8', description: 'Down, down, down, by the creek'},
+    { name: 'underdark',    url: 'https://www.youtube.com/watch?v=NMUoicf5kYw', description: 'Quiet echoes and lingering evil'},
+    { name: 'wilderness_night', url: 'https://www.youtube.com/watch?v=ybTXj_OE4-k', description: 'The wilderness at night'}, 
+]
+
+const RESOURCE_URBAN = [ 
+    { name: 'blacksmith',   url: 'https://www.youtube.com/watch?v=lxKVT1r4sgU', description: 'Ambient bellows'},
+    { name: 'city_crowd',   url: 'https://www.youtube.com/watch?v=_52K0E_gNY0', description: 'Loud, crowded medieval city'},
+    { name: 'city_night',   url: 'https://www.youtube.com/watch?v=FvgV3G-EnnQ', description: 'Evening in the city'},
+    { name: 'city_indoors', url: 'https://www.youtube.com/watch?v=inG4BLxwlJ4', description: 'Muffled outside commotion'},
+    { name: 'harbour',      url: 'https://www.youtube.com/watch?v=frEJTGfLOhM', description: 'Seagulls, chatter, water, and boats'},
+    { name: 'harbour_night', url: 'https://www.youtube.com/watch?v=g204M-lCLF8', description: 'Bells and tranquil waters'},
+    { name: 'library',      url: 'https://www.youtube.com/watch?v=VvC12NAf-Cw', description: 'Quiet library'},
+    { name: 'lumber_camp',  url: 'https://www.youtube.com/watch?v=qkXlgCFnJC8', description: 'Wood chopping and bird song'},
+    { name: 'marketplace',  url: 'https://www.youtube.com/watch?v=x2UulCWGess', description: 'People talking and haggling'},
+    { name: 'sewer',        url: 'https://www.youtube.com/watch?v=9QZ_2wKbb5o', description: 'Water and rats'},
+    { name: 'tavern_thieves', url: 'https://www.youtube.com/watch?v=Ag8sbpNXBEQ', description: 'Poisons, contracts, and mercenaries gather'},
     { name: 'tavern_lively', url: 'https://www.youtube.com/watch?v=KecVJnJcSI4', description: 'Crowded tavern'},
     { name: 'tavern_warm',  url: 'https://www.youtube.com/watch?v=rv3Nl-Od9YU', description: 'Cozy tavern with fireplace'},
+    { name: 'war_camp',     url: 'https://www.youtube.com/watch?v=QP0hRjF4d6k', description: 'Sharpening blades and war preparations'},
+]
+
+const RESOURCE_CLIMATE = [
+    { name: 'blizzard_heavy', url: 'https://www.youtube.com/watch?v=cpGgQHAublY', description: 'Snow and a heavy, icy wind storm'},
+    { name: 'blizzard_light', url: 'https://www.youtube.com/watch?v=RhvyGiJs120', description: 'Cold winds echo across the icy valley floor'},
+    { name: 'fire',         url: 'https://www.youtube.com/watch?v=2ya2drfb4rA', description: 'Building on fire'},
+    { name: 'hellish',      url: 'https://www.youtube.com/watch?v=JzVIkY5tKcE', description: 'Evil and haunting screams'},
+    { name: 'rain',         url: 'https://www.youtube.com/watch?v=KSSpVMIgN2Y', description: 'Persistent showers'},
+    { name: 'storm_light',  url: 'https://www.youtube.com/watch?v=2wqf6nvML7Y', description: 'Mild thunderstorm'},
+    { name: 'storm_heavy',  url: 'https://www.youtube.com/watch?v=KQ8MajN-61Q', description: 'Severe thunderstorm'},
     { name: 'underwater',   url: 'https://www.youtube.com/watch?v=NY3XkLe6oKQ', description: 'Echoes of the deep'},
     { name: 'wildfire',     url: 'https://www.youtube.com/watch?v=S3C1LfiLob8', description: 'Intense flames and things burning'},
-    { name: 'wilderness_night', url: 'https://www.youtube.com/watch?v=ybTXj_OE4-k', description: 'The wilderness at night'},
+    { name: 'winds_nature', url: 'https://www.youtube.com/watch?v=7WPsftkv1ZY', description: 'Soothing forest winds'},
+    { name: 'winds_heavy',  url: 'https://www.youtube.com/watch?v=oy0jX_I1CIU', description: 'Heavy, stable winds'},
 ]

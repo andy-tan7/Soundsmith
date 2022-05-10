@@ -24,7 +24,7 @@ import { promisify } from 'node:util';
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {};
 const DISPLAY_QUEUE_MAX_LENGTH = 1800;
-const VOLUME_LOGARITHMIC = 0.5;
+const DEFAULT_VOLUME_LOG = 0.5;
 const wait = promisify(setTimeout);
 
 /**
@@ -134,6 +134,23 @@ class SoundsmithConnection {
         void this.processQueue();
     }
 
+    public enqueueMultiple(tracks: SoundObject[], enqueueAtStart: boolean) {
+        if (this.playbackFlags.shuffle)
+        {
+            tracks = this.shuffleQueue(tracks);
+        }
+
+        if (enqueueAtStart) {
+            this.queue.unshift(...tracks);
+            this.skipTrack();
+            this.audioPlayer.unpause();
+        } else {
+            this.queue.push(...tracks);
+        }
+        console.log(this.queue.length);
+        void this.processQueue();
+    }
+
     /**
      * Pick a random spot to enqueue a shuffled item. Bias to pick the further of two random positions,
      * lowering the chance that a track plays multiple times in quick succession.
@@ -212,7 +229,7 @@ class SoundsmithConnection {
     public setFlagShuffle(flag: boolean) {
         const prev = this.playbackFlags.shuffle;
         if (flag) 
-            this.shuffleQueue();
+            this.queue = this.shuffleQueue(this.queue);
         this.playbackFlags.shuffle = flag;
         return flag || flag !== prev;
     }
@@ -220,11 +237,12 @@ class SoundsmithConnection {
     /**
      * Optimized Durstenfeld shuffle 
      */
-    private shuffleQueue() {
-        for (let i = this.queue.length - 1; i > 0; i--) {
+    private shuffleQueue(queue: SoundObject[]) {
+        for (let i = queue.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i+1));
-            [this.queue[i], this.queue[j]] = [this.queue[j], this.queue[i]];
+            [queue[i], queue[j]] = [queue[j], queue[i]];
         }
+        return queue;
     }
 
     /**
@@ -245,7 +263,6 @@ class SoundsmithConnection {
      * Attempts to play a SoundObject from the queue.
      */
     private async processQueue(): Promise<void> {
-        console.log(`Queue lock: ${this.queueLock}`);
         // Return if the queue is locked (already being processed), or the audio player is already playing something
         if (this.queueLock || this.audioPlayer.state.status !== AudioPlayerStatus.Idle) 
             return;
@@ -275,8 +292,8 @@ class SoundsmithConnection {
 
         try {
             const resource = await nextTrack.createAudioResource();
-            resource.volume?.setVolumeLogarithmic(VOLUME_LOGARITHMIC);
-            console.log(` * Now playing audio resource: ${nextTrack.title}`);
+            resource.volume?.setVolumeLogarithmic(nextTrack.volumeAdjust);
+            console.log(` * Now playing audio resource (Vol: ${nextTrack.volumeAdjust}): ${nextTrack.title}`);
 
             // Keep track of the currently playing object for loops and repeats.
             this.currentObject = nextTrack; 
@@ -296,6 +313,7 @@ interface SoundObjectData {
     title: string;
     lengthSeconds: number;
     user: string;
+    volumeAdjust: number;
     onStart: () => void;
     onFinish: () => void;
     onError: (error: Error) => void;
@@ -315,15 +333,17 @@ class SoundObject implements SoundObjectData {
     public readonly title: string;
     public readonly lengthSeconds: number;
     public readonly user: string;
+    public readonly volumeAdjust: number;
     public onStart: () => void;
     public readonly onFinish: () => void;
     public readonly onError: (error: Error) => void;
 
-    private constructor({ url, title, lengthSeconds, user, onStart, onFinish, onError}: SoundObjectData) {
+    private constructor({ url, title, lengthSeconds, user, volumeAdjust, onStart, onFinish, onError}: SoundObjectData) {
         this.url = url;
         this.title = title;
         this.lengthSeconds = lengthSeconds;
         this.user = user;
+        this.volumeAdjust = Math.min(1, volumeAdjust);
         this.onStart = onStart;
         this.onFinish = onFinish;
         this.onError = onError;
@@ -347,7 +367,7 @@ class SoundObject implements SoundObjectData {
      * 
      * @returns the created track
      */
-     public static async from(info: YouTubeVideo, user: string, methods: Pick<SoundObject, 'onStart' | 'onFinish' | 'onError'>): Promise<SoundObject> {
+     public static async from(info: YouTubeVideo, user: string, methods: Pick<SoundObject, 'onStart' | 'onFinish' | 'onError'>, volumeAdjust?: number): Promise<SoundObject> {
 
         // The methods are wrapped so that we can ensure that they are only called once.
         const wrappedMethods = {
@@ -369,6 +389,7 @@ class SoundObject implements SoundObjectData {
             title: info.title? info.title : "Untitled",
             lengthSeconds: info.durationInSec,
             user: user,
+            volumeAdjust: volumeAdjust ? volumeAdjust : DEFAULT_VOLUME_LOG,
             url: info.url, 
             ...wrappedMethods,
         });
@@ -459,9 +480,9 @@ client.on('messageCreate', async (message) => {
                     },
                 ],
             },
-            generateAmbientCommandWithOptions('ambient_area', '(Default) Select a preset ambient area sound to play', RESOURCE_AREA),
-            generateAmbientCommandWithOptions('ambient_climate', 'Select a preset ambient climate sound to play', RESOURCE_CLIMATE),
-            generateAmbientCommandWithOptions('ambient_urban', 'Select a preset ambient urban sound to play', RESOURCE_URBAN),
+            generateAmbientCommandWithOptions('ambient_location', 'Play a preset ambience for a scene or locale.', RESOURCE_LOCATION),
+            generateAmbientCommandWithOptions('ambient_elements', 'Play a preset ambience for weather and conditions', RESOURCE_ELEMENTS),
+            generateAmbientCommandWithOptions('ambient_urban', 'Play a preset urban or civilized ambience', RESOURCE_URBAN),
         ]);
 
         await message.reply('Deployed!');
@@ -486,9 +507,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         case 'loop':    commandLoop(interaction, soundsmithConnection);    break;
         case 'shuffle': commandShuffle(interaction, soundsmithConnection); break;
         case 'repeat':  commandRepeat(interaction, soundsmithConnection);  break;
-        case 'ambient_area': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_location': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_elements': commandAmbient(interaction, soundsmithConnection); break;
         case 'ambient_urban': commandAmbient(interaction, soundsmithConnection); break;
-        case 'ambient_climate': commandAmbient(interaction, soundsmithConnection); break;
         default: await interaction.reply({ content: 'Unknown command', ephemeral: true});
     }
 })
@@ -528,12 +549,19 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
             
             if (playlist) {
                 let videos = await playlist.all_videos();
+                if (videos.length === 0) {
+                    console.warn('No videos found in playlist, or invalid YouTube playlist.');
+                    interaction.followUp('No videos found in playlist, or invalid YouTube playlist.');
+                    return;
+                }
                 videos.forEach(video => { console.log(`Added track: ${video.title}, url: ${video.url} `) });
 
                 if (clearQueue) {
                     await interaction.followUp('Cleared the queue!');
                     soundsmithConnection.stopQueue();
                 }
+
+                let tracks: SoundObject[] = [];
                 // Create SoundObjects for every video retrievable from the playlist.
                 for (let i = 0; i < videos.length; i++) {
                     const soundObject = await SoundObject.from(videos[i], user, {
@@ -546,8 +574,10 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
                     })
 
                     // Enqueue the track.
-                    enqueueObject(soundsmithConnection, soundObject, enqueueAtStart);
+                    tracks.push(soundObject);
+                    // enqueueObject(soundsmithConnection, soundObject, enqueueAtStart);
                 }
+                enqueueMultiple(soundsmithConnection, tracks, enqueueAtStart);
                 interaction.followUp(`${videos.length} tracks have been added to the ${enqueueAtStart ? "front of the " : ""}queue.`);
             } else {
                 console.warn('No videos found in playlist, or invalid YouTube playlist.');
@@ -604,6 +634,8 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
     await interaction.deferReply();
     try {
         const info = await playdl.video_info(url);
+        let volumeAdjust = ((RESOURCE_LOCATION.concat(RESOURCE_ELEMENTS).concat(RESOURCE_URBAN)).find(obj => { return obj.url === url}))?.volume;
+
         const soundObject = await SoundObject.from(info.video_details, user, {
             onStart() { },  
             onFinish() { }, // Finish silently to reduce spam
@@ -611,7 +643,7 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
                 console.warn(error);
                 interaction.followUp(`Error: ${error.message}`).catch(console.warn);
             },
-        })
+        }, volumeAdjust)
 
         // Insert the track, and reply a success message to the user.
         if (clearQueue) {
@@ -735,7 +767,7 @@ async function commandQueue(interaction: CommandInteraction, soundsmithConnectio
             queueText += `\n\n...And ${soundsmithConnection.queue.length - songIndex} more tracks...`;
         }
         
-        await interaction.reply(`${current}\n${queueText}\n**${soundsmithConnection.getQueueLength()}** total of queued tracks remaining.`);
+        await interaction.reply(`${current}\n${queueText}\n**${soundsmithConnection.getQueueLength()}** total duration of queued tracks remaining.`);
     } else 
         await interaction.reply({ content: 'Soundsmith is not playing in this server!', ephemeral: true});
 }
@@ -866,6 +898,10 @@ function enqueueObject(soundsmithConnection: SoundsmithConnection, soundObject: 
     enqueueAtStart ? soundsmithConnection.enqueueStart(soundObject) : soundsmithConnection.enqueue(soundObject);
 }
 
+function enqueueMultiple(soundsmithConnection: SoundsmithConnection, soundObjects: SoundObject[], enqueueAtStart: boolean) {
+     soundsmithConnection.enqueueMultiple(soundObjects, enqueueAtStart);
+}
+
 /**
  * Try to join the user's voice channel if they are in one. Any command that plays music will need to do this.
  */
@@ -938,54 +974,61 @@ function generateAmbientCommandWithOptions(commandName: string, commandDescripti
 }
 
 // This list is limited to 25 due to Discord API limitations. I may add other commands in the future.
-const RESOURCE_AREA = [ 
-    { name: 'catacombs',    url: 'https://www.youtube.com/watch?v=WPpVMmTt74Q', description: 'Eerie echoes of shadows between old tombs'},
-    { name: 'camp_night',   url: 'https://www.youtube.com/watch?v=LYF2VzCN0os', description: 'Cozy camp in the eerie night'},
-    { name: 'countryside',  url: 'https://www.youtube.com/watch?v=wEEc9RhHTzU', description: 'Calm countryside with animal sounds'},
-    { name: 'cult_temple',  url: 'https://www.youtube.com/watch?v=UxOLopND4CA', description: 'Echoes and distant, evil chants'},
-    { name: 'darkness',     url: 'https://www.youtube.com/watch?v=EUtE1k0VXKI', description: 'Echoes of the ruins below'},
-    { name: 'dark_swamp',   url: 'https://www.youtube.com/watch?v=NQIoLiQ_uNU', description: 'Spooky ambience of a swamp'},
-    { name: 'deserted',     url: 'https://www.youtube.com/watch?v=2FpLYU8HoIo', description: 'The hollow remains of a ghost town'},
-    { name: 'dungeon',      url: 'https://www.youtube.com/watch?v=wScEFaoqwPM', description: 'Cavernous hollows'},
-    { name: 'forest_birds', url: 'https://www.youtube.com/watch?v=xNN7iTA57jM', description: 'Peaceful woodlands'},
-    { name: 'forest_eerie', url: 'https://www.youtube.com/watch?v=QQg0br-eZUg', description: 'Uneasy woods'},
-    { name: 'haunted_night', url: 'https://www.youtube.com/watch?v=58dAcjgtfbk', description: 'Spooky ghost sounds and crows'},
-    { name: 'mines',        url: 'https://www.youtube.com/watch?v=F41CoM8gIqA', description: 'Echoing caves, pickaxes and mines'},
-    { name: 'ocean_cave',   url: 'https://www.youtube.com/watch?v=Z-pbILkmhMk', description: 'Cave by the ocean'},
-    { name: 'ocean_shore',  url: 'https://www.youtube.com/watch?v=WcqURB6_E5I', description: 'Waves crash into jagged cliffs'},
-    { name: 'plains_morning', url: 'https://www.youtube.com/watch?v=q89BgsmHFMc', description: 'Morning birds'},
-    { name: 'river',        url: 'https://www.youtube.com/watch?v=lR4GNWcwAI8', description: 'Down, down, down, by the creek'},
-    { name: 'underdark',    url: 'https://www.youtube.com/watch?v=NMUoicf5kYw', description: 'Quiet echoes and lingering evil'},
-    { name: 'wilderness_night', url: 'https://www.youtube.com/watch?v=ybTXj_OE4-k', description: 'The wilderness at night'}, 
+const RESOURCE_LOCATION = [ 
+    { name: 'arcane_cave',  url: 'https://www.youtube.com/watch?v=TUCzY-6XjUo', volume: 0.50, description: 'Shimmering echoes and ringing'},
+    { name: 'catacombs',    url: 'https://www.youtube.com/watch?v=WPpVMmTt74Q', volume: 0.50, description: 'Eerie echoes of shadows between old tombs'},
+    { name: 'camp_night',   url: 'https://www.youtube.com/watch?v=LYF2VzCN0os', volume: 0.56, description: 'Cozy camp in the eerie night'},
+    { name: 'countryside',  url: 'https://www.youtube.com/watch?v=wEEc9RhHTzU', volume: 0.41, description: 'Calm countryside with animal sounds'},
+    { name: 'cult_temple',  url: 'https://www.youtube.com/watch?v=UxOLopND4CA', volume: 0.35, description: 'Echoes and distant, evil chants'},
+    { name: 'dark_ruins',   url: 'https://www.youtube.com/watch?v=EUtE1k0VXKI', volume: 0.53, description: 'Echoes of the ruins below'},
+    { name: 'dark_swamp',   url: 'https://www.youtube.com/watch?v=NQIoLiQ_uNU', volume: 0.39, description: 'Spooky ambience of a swamp'},
+    { name: 'deserted',     url: 'https://www.youtube.com/watch?v=2FpLYU8HoIo', volume: 0.52, description: 'The hollow remains of a ghost town'},
+    { name: 'dungeon',      url: 'https://www.youtube.com/watch?v=wScEFaoqwPM', volume: 0.56, description: 'Cavernous hollows'},
+    { name: 'forest_birds', url: 'https://www.youtube.com/watch?v=xNN7iTA57jM', volume: 0.47, description: 'Peaceful woodlands'},
+    { name: 'forest_eerie', url: 'https://www.youtube.com/watch?v=QQg0br-eZUg', volume: 0.58, description: 'Uneasy woods'},
+    { name: 'haunted_night', url: 'https://www.youtube.com/watch?v=58dAcjgtfbk', volume: 0.37, description: 'Spooky ghost sounds and crows'},
+    { name: 'mines',        url: 'https://www.youtube.com/watch?v=F41CoM8gIqA', volume: 0.49, description: 'Echoing caves, pickaxes and mines'},
+    { name: 'ocean_cave',   url: 'https://www.youtube.com/watch?v=Z-pbILkmhMk', volume: 0.47, description: 'Cave by the ocean'},
+    { name: 'ocean_shore',  url: 'https://www.youtube.com/watch?v=WcqURB6_E5I', volume: 0.44, description: 'Waves crash into jagged cliffs'},
+    { name: 'plains_morning', url: 'https://www.youtube.com/watch?v=q89BgsmHFMc', volume: 0.48, description: 'Morning birds'},
+    { name: 'river',        url: 'https://www.youtube.com/watch?v=lR4GNWcwAI8', volume: 0.5, description: 'Down, down, down, by the creek'},
+    { name: 'underdark',    url: 'https://www.youtube.com/watch?v=NMUoicf5kYw', volume: 0.57, description: 'Quiet echoes and lingering evil'},
+    { name: 'volcano',      url: 'https://www.youtube.com/watch?v=i56VB6j6kHE', volume: 0.48, description: 'Magma, searing fire, and lava'},
+    { name: 'wilderness_night', url: 'https://www.youtube.com/watch?v=ybTXj_OE4-k', volume: 0.32, description: 'The wilderness at night'}, 
 ]
 
 const RESOURCE_URBAN = [ 
-    { name: 'blacksmith',   url: 'https://www.youtube.com/watch?v=lxKVT1r4sgU', description: 'Ambient bellows'},
-    { name: 'city_crowd',   url: 'https://www.youtube.com/watch?v=_52K0E_gNY0', description: 'Loud, crowded medieval city'},
-    { name: 'city_night',   url: 'https://www.youtube.com/watch?v=FvgV3G-EnnQ', description: 'Evening in the city'},
-    { name: 'city_indoors', url: 'https://www.youtube.com/watch?v=inG4BLxwlJ4', description: 'Muffled outside commotion'},
-    { name: 'harbour',      url: 'https://www.youtube.com/watch?v=frEJTGfLOhM', description: 'Seagulls, chatter, water, and boats'},
-    { name: 'harbour_night', url: 'https://www.youtube.com/watch?v=g204M-lCLF8', description: 'Bells and tranquil waters'},
-    { name: 'library',      url: 'https://www.youtube.com/watch?v=VvC12NAf-Cw', description: 'Quiet library'},
-    { name: 'lumber_camp',  url: 'https://www.youtube.com/watch?v=qkXlgCFnJC8', description: 'Wood chopping and bird song'},
-    { name: 'marketplace',  url: 'https://www.youtube.com/watch?v=x2UulCWGess', description: 'People talking and haggling'},
-    { name: 'sewer',        url: 'https://www.youtube.com/watch?v=9QZ_2wKbb5o', description: 'Water and rats'},
-    { name: 'tavern_thieves', url: 'https://www.youtube.com/watch?v=Ag8sbpNXBEQ', description: 'Poisons, contracts, and mercenaries gather'},
-    { name: 'tavern_lively', url: 'https://www.youtube.com/watch?v=KecVJnJcSI4', description: 'Crowded tavern'},
-    { name: 'tavern_warm',  url: 'https://www.youtube.com/watch?v=rv3Nl-Od9YU', description: 'Cozy tavern with fireplace'},
-    { name: 'war_camp',     url: 'https://www.youtube.com/watch?v=QP0hRjF4d6k', description: 'Sharpening blades and war preparations'},
+    { name: 'arena',        url: 'https://www.youtube.com/watch?v=v5c0zLmVZR4', volume: 0.5, description: 'Loud cheering and booing and clashing'},
+    { name: 'blacksmith',   url: 'https://www.youtube.com/watch?v=lxKVT1r4sgU', volume: 0.51, description: 'Ambient bellows'},
+    { name: 'city_crowd',   url: 'https://www.youtube.com/watch?v=_52K0E_gNY0', volume: 0.36, description: 'Loud, crowded medieval city'},
+    { name: 'city_night',   url: 'https://www.youtube.com/watch?v=FvgV3G-EnnQ', volume: 0.41, description: 'Evening in the city'},
+    { name: 'city_indoors', url: 'https://www.youtube.com/watch?v=inG4BLxwlJ4', volume: 0.53, description: 'Muffled outside commotion'},
+    { name: 'harbour',      url: 'https://www.youtube.com/watch?v=frEJTGfLOhM', volume: 0.51, description: 'Seagulls, chatter, water, and boats'},
+    { name: 'harbour_night', url: 'https://www.youtube.com/watch?v=g204M-lCLF8', volume: 0.52, description: 'Bells and tranquil waters'},
+    { name: 'library',      url: 'https://www.youtube.com/watch?v=VvC12NAf-Cw', volume: 0.59, description: 'Quiet library'},
+    { name: 'lumber_camp',  url: 'https://www.youtube.com/watch?v=qkXlgCFnJC8', volume: 0.49, description: 'Wood chopping and bird song'},
+    { name: 'mansion_haunted', url: 'https://www.youtube.com/watch?v=oef3XIRUeII', volume: 0.58, description: 'Evil hanging in the quiet'},
+    { name: 'marketplace',  url: 'https://www.youtube.com/watch?v=x2UulCWGess', volume: 0.41, description: 'People talking and haggling'},
+    { name: 'prison',       url: 'https://www.youtube.com/watch?v=FVmWdIwjgKA', volume: 0.42, description: 'Metal doors and disturbing drones'},
+    { name: 'sewer',        url: 'https://www.youtube.com/watch?v=9QZ_2wKbb5o', volume: 0.39, description: 'Water and rats'},
+    { name: 'tavern_thieves', url: 'https://www.youtube.com/watch?v=Ag8sbpNXBEQ', volume: 0.49, description: 'Poisons, contracts, and mercenaries gather'},
+    { name: 'tavern_lively', url: 'https://www.youtube.com/watch?v=KecVJnJcSI4', volume: 0.4, description: 'Crowded tavern'},
+    { name: 'tavern_warm',  url: 'https://www.youtube.com/watch?v=rv3Nl-Od9YU', volume: 0.56, description: 'Cozy tavern with fireplace'},
+    { name: 'war_camp',     url: 'https://www.youtube.com/watch?v=QP0hRjF4d6k', volume: 0.58, description: 'Sharpening blades and war preparations'},
 ]
 
-const RESOURCE_CLIMATE = [
-    { name: 'blizzard_heavy', url: 'https://www.youtube.com/watch?v=cpGgQHAublY', description: 'Snow and a heavy, icy wind storm'},
-    { name: 'blizzard_light', url: 'https://www.youtube.com/watch?v=RhvyGiJs120', description: 'Cold winds echo across the icy valley floor'},
-    { name: 'fire',         url: 'https://www.youtube.com/watch?v=2ya2drfb4rA', description: 'Building on fire'},
-    { name: 'hellish',      url: 'https://www.youtube.com/watch?v=JzVIkY5tKcE', description: 'Evil and haunting screams'},
-    { name: 'rain',         url: 'https://www.youtube.com/watch?v=KSSpVMIgN2Y', description: 'Persistent showers'},
-    { name: 'storm_light',  url: 'https://www.youtube.com/watch?v=2wqf6nvML7Y', description: 'Mild thunderstorm'},
-    { name: 'storm_heavy',  url: 'https://www.youtube.com/watch?v=KQ8MajN-61Q', description: 'Severe thunderstorm'},
-    { name: 'underwater',   url: 'https://www.youtube.com/watch?v=NY3XkLe6oKQ', description: 'Echoes of the deep'},
-    { name: 'wildfire',     url: 'https://www.youtube.com/watch?v=S3C1LfiLob8', description: 'Intense flames and things burning'},
-    { name: 'winds_nature', url: 'https://www.youtube.com/watch?v=7WPsftkv1ZY', description: 'Soothing forest winds'},
-    { name: 'winds_heavy',  url: 'https://www.youtube.com/watch?v=oy0jX_I1CIU', description: 'Heavy, stable winds'},
+const RESOURCE_ELEMENTS = [
+    { name: 'blizzard_heavy', url: 'https://www.youtube.com/watch?v=cpGgQHAublY', volume: 0.43, description: 'Snow and a heavy, icy wind storm'},
+    { name: 'blizzard_light', url: 'https://www.youtube.com/watch?v=RhvyGiJs120', volume: 0.46, description: 'Cold winds echo across the icy valley floor'},
+    { name: 'fire',         url: 'https://www.youtube.com/watch?v=2ya2drfb4rA', volume: 0.52, description: 'Building on fire'},
+    { name: 'fog_of_war',   url: 'https://www.youtube.com/watch?v=fbUsBAocY1o', volume: 0.46, description: 'Eerie stretched sounds'},
+    { name: 'hellish',      url: 'https://www.youtube.com/watch?v=JzVIkY5tKcE', volume: 0.5, description: 'Evil and haunting screams'},
+    { name: 'rain',         url: 'https://www.youtube.com/watch?v=KSSpVMIgN2Y', volume: 0.52, description: 'Persistent showers'},
+    { name: 'sandstorm',    url: 'https://www.youtube.com/watch?v=2pP7orLxU4U', volume: 0.38, description: 'Biting winds and sand'},
+    { name: 'storm_light',  url: 'https://www.youtube.com/watch?v=2wqf6nvML7Y', volume: 0.52, description: 'Mild thunderstorm'},
+    { name: 'storm_heavy',  url: 'https://www.youtube.com/watch?v=KQ8MajN-61Q', volume: 0.48, description: 'Severe thunderstorm'},
+    { name: 'underwater',   url: 'https://www.youtube.com/watch?v=NY3XkLe6oKQ', volume: 0.53, description: 'Echoes of the deep'},
+    { name: 'wildfire',     url: 'https://www.youtube.com/watch?v=S3C1LfiLob8', volume: 0.32, description: 'Intense flames and things burning'},
+    { name: 'winds_nature', url: 'https://www.youtube.com/watch?v=7WPsftkv1ZY', volume: 0.65, description: 'Soothing forest winds'},
+    { name: 'winds_elevated', url: 'https://www.youtube.com/watch?v=oy0jX_I1CIU', volume: 0.59, description: 'Heavy, stable winds'},
 ]

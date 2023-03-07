@@ -16,7 +16,7 @@ import {
     VoiceConnectionStatus,
     VoiceConnectionDisconnectReason,
 } from '@discordjs/voice';
-import { Interaction, Client, GuildMember, CommandInteraction, ApplicationCommandData, ApplicationCommandOptionData, ApplicationCommandOptionChoice } from 'discord.js';
+import { Interaction, Client, GuildMember, CommandInteraction, ApplicationCommandData, ApplicationCommandOptionData, ApplicationCommandOptionChoiceData } from 'discord.js';
 import playdl, { YouTubeVideo } from 'play-dl';
 import dotenv from 'dotenv';
 import { promisify } from 'node:util';
@@ -25,7 +25,15 @@ import { promisify } from 'node:util';
 const noop = () => {};
 const DISPLAY_QUEUE_MAX_LENGTH = 1800;
 const DEFAULT_VOLUME_LOG = 0.5;
+const DEFAULT_VOLUME_ADJUST_MULTIPLIER = 0.85;
 const wait = promisify(setTimeout);
+const DICE_ADVANTAGE = 'adv'
+const DICE_DISADVANTAGE = 'dis'
+const DICE_DROPN = 'drop'
+const DICE_AMOUNT_CAP = 250;
+const DIE_SIZE_CAP = 1000;
+const DICE_REASONABLE_CAP = 99999;
+const DICE_MESSAGE_LENGTH_CAP = 100;
 
 /**
  * A SoundsmithConnection exists for each active VoiceConnection. Each connection has its own 
@@ -343,7 +351,7 @@ class SoundObject implements SoundObjectData {
         this.title = title;
         this.lengthSeconds = lengthSeconds;
         this.user = user;
-        this.volumeAdjust = Math.min(1, volumeAdjust);
+        this.volumeAdjust = Math.min(1, volumeAdjust) * DEFAULT_VOLUME_ADJUST_MULTIPLIER;
         this.onStart = onStart;
         this.onFinish = onFinish;
         this.onError = onError;
@@ -483,6 +491,53 @@ client.on('messageCreate', async (message) => {
             generateAmbientCommandWithOptions('ambient_location', 'Play a preset ambience for a scene or locale.', RESOURCE_LOCATION),
             generateAmbientCommandWithOptions('ambient_elements', 'Play a preset ambience for weather and conditions', RESOURCE_ELEMENTS),
             generateAmbientCommandWithOptions('ambient_urban', 'Play a preset urban or civilized ambience', RESOURCE_URBAN),
+            generateAmbientCommandWithOptions('ambient_travel', 'Play a preset travel ambience', RESOURCE_TRAVEL),
+
+            { name: 'rollf', description: 'Roll some dice with Discord command argument formatting.', 
+                options: [
+                    {
+                        name: 'number_of_dice', 
+                        type: 'INTEGER' as const, 
+                        description: 'The number of dice to roll (e.g., 3d6 is three dice)', 
+                        required: true, 
+                    },
+                    {
+                        name: 'die_size', 
+                        type: 'INTEGER' as const, 
+                        description: 'The size of the die to roll (e.g., enter 20 for a d20)', 
+                        required: true, 
+                    },
+                    {
+                        name: 'modifier', 
+                        type: 'STRING' as const, 
+                        description: 'Roll with advantage or disadvantage?', 
+                        required: false, 
+                        choices: [ { name: 'advantage', value: '1', }, { name: 'disadvantage', value: '2', }, { name: 'none', value: '0', } ],
+                    },
+                    {
+                        name: 'drop',
+                        type: 'INTEGER' as const,
+                        description: 'Drop the lowest of this many dice (e.g., 4d6 drop 1)',
+                        required: false,
+                    },
+                    {
+                        name: 'reason', 
+                        type: 'STRING' as const, 
+                        description: 'Note to self and others: what is this roll for?', 
+                        required: false, 
+                    },
+                ],
+            },
+            { name: 'roll', description: 'Roll some dice using dice notation.', 
+                options: [
+                    {
+                        name: 'dice_notation', 
+                        type: 'STRING' as const, 
+                        description: 'Optional: \'adv\' or \'dis\', notes (e.g., d20 adv to persuade me)', 
+                        required: true, 
+                    },
+                ],
+            },
         ]);
 
         await message.reply('Deployed!');
@@ -510,6 +565,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         case 'ambient_location': commandAmbient(interaction, soundsmithConnection); break;
         case 'ambient_elements': commandAmbient(interaction, soundsmithConnection); break;
         case 'ambient_urban': commandAmbient(interaction, soundsmithConnection); break;
+        case 'ambient_travel': commandAmbient(interaction, soundsmithConnection); break;
+        case 'rollf': commandRollArguments(interaction); break;
+        case 'roll': commandRollString(interaction); break;
         default: await interaction.reply({ content: 'Unknown command', ephemeral: true});
     }
 })
@@ -640,7 +698,7 @@ async function commandPlay(interaction: CommandInteraction, soundsmithConnection
             onStart() { },  
             onFinish() { }, // Finish silently to reduce spam
             onError(error: any) {
-                console.warn(error);
+                console.warn(error + "|" + info.video_details);
                 interaction.followUp(`Error: ${error.message}`).catch(console.warn);
             },
         }, volumeAdjust)
@@ -880,6 +938,139 @@ async function commandShuffle(interaction: CommandInteraction, soundsmithConnect
         await interaction.reply({ content: 'Soundsmith is not playing in this server!', ephemeral: true});
 }
 
+async function commandRollString(interaction: CommandInteraction) {
+    try {
+        const inputString = interaction.options.get('dice_notation')!.value as string;
+        const matchGroups = inputString.match(/^(\d*)d(\d+)\s*(\+\s*[0-9]+|\-\s*[0-9]+|\s*)\s*($|adv\s|adv$|dis\s|dis$|drop\s\d+|d\s\d+|\s*)($|.*|$)/i);
+        //const matchGroups = inputString.match(/^(\d*)d(\d+)\s*($|adv\s|adv$|dis\s|dis$|.*)($|.*)/i);///^(\d*)d(\d+)\s*($|adv|dis)/);
+
+        console.log(`Matched. #Groups: ${matchGroups?.length} -> ${matchGroups}`);
+        if (matchGroups) {
+            const dieValue = parseInt(matchGroups[2]);
+            const numOfDice = matchGroups[1] ? parseInt(matchGroups[1]) : 1;
+            const rollModifier = matchGroups[3] ? parseInt(matchGroups[3].replace(' ', '')) : 0;
+            const rollModifierString = matchGroups[4] ? matchGroups[4] : null;
+            let rollModifierType: number | null = null;
+            let dropCount: number | null = null;
+            if (rollModifierString) {
+                if (rollModifierString.toLowerCase().startsWith(DICE_ADVANTAGE)) {
+                    rollModifierType = DiceModifiers.Advantage;
+                } else if (rollModifierString.toLowerCase().startsWith(DICE_DISADVANTAGE)) {
+                    rollModifierType = DiceModifiers.Disadvantage;
+                } else if (rollModifierString.toLowerCase().startsWith(DICE_DROPN) || rollModifierString.toLowerCase().startsWith("d ")) {
+                    rollModifierType = DiceModifiers.DropN;
+                    dropCount = parseInt(rollModifierString.split(" ")[1]);
+                    console.log(`Dropping ${dropCount} lowest dice`)
+                }
+            }
+
+            const reason: string | null = matchGroups[5];
+
+            if (numOfDice < 1) {
+                await interaction.reply({ content: 'You must roll at least one die!', ephemeral: true });
+                return;
+            } else if (dieValue < 1) {
+                await interaction.reply({ content: 'You must roll a positive sized die!', ephemeral: true });
+                return; 
+            } else if (numOfDice > DICE_REASONABLE_CAP || dieValue > DICE_REASONABLE_CAP) {
+                await interaction.reply({ content: 'Please use reasonably small sized numbers!', ephemeral: true });
+                return; 
+            }
+
+            const resultString = calcRollResultsString(dieValue, numOfDice, rollModifier, rollModifierType, dropCount, reason);
+            await interaction.reply(resultString);
+        } else {
+            await interaction.reply({ content: 'Failed to parse dice notation. Please try again.', ephemeral: true });
+        }
+
+
+    } catch (error) {
+        await interaction.reply({ content: 'Failed to roll. Please ask for the logs.', ephemeral: true });
+    }
+}
+
+/**
+ * Roll some dice.
+ */
+async function commandRollArguments(interaction: CommandInteraction) {
+    try {
+        const dieValue =  interaction.options.get('die_size')!.value as number;
+        const numOfDice = interaction.options.get('number_of_dice') ? interaction.options.get('number_of_dice')!.value as number : 1;
+        const rollModifierType = interaction.options.get('vantage') ? interaction.options.get('vantage')!.value as number : null;
+        const dropCount = interaction.options.get('drop') ? interaction.options.get('drop')!.value as number : null;
+        const reason = interaction.options.get('reason')?.value as string | null
+
+        if (numOfDice < 1) {
+            await interaction.reply({ content: 'You must roll at least one die!', ephemeral: true });
+            return;
+        } else if (dieValue < 1) {
+            await interaction.reply({ content: 'You must roll a positive sized die!', ephemeral: true });
+            return;
+        } else if (numOfDice > DICE_REASONABLE_CAP || dieValue > DICE_REASONABLE_CAP) {
+            await interaction.reply({ content: 'Please use reasonably small sized numbers!', ephemeral: true });
+            return; 
+        }
+
+        const resultString = calcRollResultsString(dieValue, numOfDice, 0, rollModifierType, dropCount, reason);
+        await interaction.reply(resultString);
+
+    } catch (error) {
+        await interaction.reply({ content: 'Failed to roll. Please ask for the logs.', ephemeral: true });
+    }
+}
+
+function calcRollResultsString(dieValue: number, numOfDice: number, rollModifier: number, rollModifierType: number | null, dropCount: number | null, reason: string | null): string {
+    let rollResults: { diceValues: number[], result: number };
+    let resultString = '';
+
+    // Format the "reason" quote in the message reply.
+    if (reason) {
+        const inputLength = reason.length;
+        reason = reason.substring(0, Math.min(DICE_MESSAGE_LENGTH_CAP, reason.length))
+        resultString += `> _${reason}_`;
+        resultString += `${(inputLength > DICE_MESSAGE_LENGTH_CAP) ? '...' : ''}\n`;
+    }
+
+    if (rollModifierType == DiceModifiers.Advantage || rollModifierType == DiceModifiers.Disadvantage) {
+        rollResults = SoundsmithDiceRoller.commandRollWithModifier(dieValue, rollModifierType, numOfDice);
+        resultString += `:game_die: **d${dieValue}** with ${rollModifierType == DiceModifiers.Advantage ? '**Advantage**' : '**Disadvantage**'}${numOfDice > 2 ? ` (x${numOfDice})` : ''}`;
+    } else if (rollModifierType == DiceModifiers.DropN) {
+        rollResults = SoundsmithDiceRoller.commandRollWithModifier(dieValue, rollModifierType, dropCount, numOfDice);
+        resultString += `:game_die: **d${dieValue}** dropping the lowest ${dropCount}`
+    } else {
+        rollResults = SoundsmithDiceRoller.commandRollRegular(dieValue, numOfDice);
+        resultString += `:game_die: **${numOfDice}d${dieValue}**`;
+    }
+
+    // Add each result to a string to be printed. Bold the numbers that match the result for emphasis.
+    // Skip this step if there are too many dice being rolled or if the die size is too large to prevent
+    // Discord from crashing if the message being sent is too long.
+    const resultNumber = rollResults.result
+    if (dieValue <= DIE_SIZE_CAP && numOfDice <= DICE_AMOUNT_CAP) {
+        resultString += ' → ['
+        for (let i = 0; i < rollResults.diceValues.length; i++) {
+            const result = rollResults.diceValues[i];
+            resultString += result === resultNumber ? `**${result}**` : result;
+    
+            if (i + 1 < rollResults.diceValues.length) {  resultString += ', '; }
+        }
+        // Close the array.
+        resultString += ']'
+    }
+    resultString += '\n────────────────────────';
+    let endResult = `Result: **${resultNumber + rollModifier}**`;
+    if (!Number.isNaN(rollModifier) && rollModifier != 0) {
+        endResult += ` (${resultNumber} ${rollModifier > 0 ? '+' : '-'} ${rollModifier})`
+    }
+    
+    if (dieValue === 20 && resultNumber === 20) {
+        resultString += `\n\n  :fire::fire::fire::fire::fire:\n:fire:  ${endResult}  :fire:\n  :fire::fire::fire::fire::fire:`;
+    } else {
+        resultString += '\n' + endResult;
+    }
+    return resultString;
+}
+
 // Helpers
 function calcTimeHMS(lengthSeconds: number) {
     let hours = Math.floor(lengthSeconds / 3600);
@@ -950,7 +1141,7 @@ async function userInVoiceAndConnectionStable(interaction: CommandInteraction, s
  * @returns The array of preset ambient song options based on the resources.
  */
 function generateAmbientCommandWithOptions(commandName: string, commandDescription: string, resource: {name: string, url: string, description: string}[]) {
-    let stageOptions: ApplicationCommandOptionChoice[] = [];
+    let stageOptions: ApplicationCommandOptionChoiceData[] = [];
     resource.forEach(r => {
         stageOptions.push({name: r.name, value: r.url});
     })
@@ -961,7 +1152,7 @@ function generateAmbientCommandWithOptions(commandName: string, commandDescripti
             type: 'STRING' as const,
             description: 'Preset',
             required: true,
-            choices: stageOptions as ApplicationCommandOptionChoice[],
+            choices: stageOptions as ApplicationCommandOptionChoiceData[],
         },
         {
             name: 'clear_queue', 
@@ -977,16 +1168,18 @@ function generateAmbientCommandWithOptions(commandName: string, commandDescripti
 const RESOURCE_LOCATION = [ 
     { name: 'arcane_cave',  url: 'https://www.youtube.com/watch?v=TUCzY-6XjUo', volume: 0.50, description: 'Shimmering echoes and ringing'},
     { name: 'catacombs',    url: 'https://www.youtube.com/watch?v=WPpVMmTt74Q', volume: 0.50, description: 'Eerie echoes of shadows between old tombs'},
-    { name: 'camp_night',   url: 'https://www.youtube.com/watch?v=LYF2VzCN0os', volume: 0.56, description: 'Cozy camp in the eerie night'},
+    { name: 'camp_night',   url: 'https://www.youtube.com/watch?v=LYF2VzCN0os', volume: 0.60, description: 'Cozy camp in the eerie night'},
     { name: 'countryside',  url: 'https://www.youtube.com/watch?v=wEEc9RhHTzU', volume: 0.41, description: 'Calm countryside with animal sounds'},
-    { name: 'cult_temple',  url: 'https://www.youtube.com/watch?v=UxOLopND4CA', volume: 0.35, description: 'Echoes and distant, evil chants'},
+    { name: 'cult_temple',  url: 'https://www.youtube.com/watch?v=UxOLopND4CA', volume: 0.36, description: 'Echoes and distant, evil chants'},
     { name: 'dark_ruins',   url: 'https://www.youtube.com/watch?v=EUtE1k0VXKI', volume: 0.53, description: 'Echoes of the ruins below'},
-    { name: 'dark_swamp',   url: 'https://www.youtube.com/watch?v=NQIoLiQ_uNU', volume: 0.39, description: 'Spooky ambience of a swamp'},
+    { name: 'dark_swamp',   url: 'https://www.youtube.com/watch?v=NQIoLiQ_uNU', volume: 0.40, description: 'Spooky ambience of a swamp'},
     { name: 'deserted',     url: 'https://www.youtube.com/watch?v=2FpLYU8HoIo', volume: 0.52, description: 'The hollow remains of a ghost town'},
     { name: 'dungeon',      url: 'https://www.youtube.com/watch?v=wScEFaoqwPM', volume: 0.56, description: 'Cavernous hollows'},
     { name: 'forest_birds', url: 'https://www.youtube.com/watch?v=xNN7iTA57jM', volume: 0.47, description: 'Peaceful woodlands'},
     { name: 'forest_eerie', url: 'https://www.youtube.com/watch?v=QQg0br-eZUg', volume: 0.58, description: 'Uneasy woods'},
+    { name: 'haunted_castle', url: 'https://www.youtube.com/watch?v=TqH8B0_YV8M', volume: 0.49, description: 'Deserted castle, or is it?'},
     { name: 'haunted_night', url: 'https://www.youtube.com/watch?v=58dAcjgtfbk', volume: 0.37, description: 'Spooky ghost sounds and crows'},
+    { name: 'jungle_shore', url: 'https://www.youtube.com/watch?v=NrEiRL7VLhs', volume: 0.45, description: 'Jungle noises by the beach'},
     { name: 'mines',        url: 'https://www.youtube.com/watch?v=F41CoM8gIqA', volume: 0.49, description: 'Echoing caves, pickaxes and mines'},
     { name: 'ocean_cave',   url: 'https://www.youtube.com/watch?v=Z-pbILkmhMk', volume: 0.47, description: 'Cave by the ocean'},
     { name: 'ocean_shore',  url: 'https://www.youtube.com/watch?v=WcqURB6_E5I', volume: 0.44, description: 'Waves crash into jagged cliffs'},
@@ -1009,6 +1202,7 @@ const RESOURCE_URBAN = [
     { name: 'lumber_camp',  url: 'https://www.youtube.com/watch?v=qkXlgCFnJC8', volume: 0.49, description: 'Wood chopping and bird song'},
     { name: 'mansion_haunted', url: 'https://www.youtube.com/watch?v=oef3XIRUeII', volume: 0.58, description: 'Evil hanging in the quiet'},
     { name: 'marketplace',  url: 'https://www.youtube.com/watch?v=x2UulCWGess', volume: 0.41, description: 'People talking and haggling'},
+    { name: 'mage_tower',   url: 'https://www.youtube.com/watch?v=F7k5rqeU6t8', volume: 0.53, description: 'Spooky ringing'},
     { name: 'prison',       url: 'https://www.youtube.com/watch?v=FVmWdIwjgKA', volume: 0.42, description: 'Metal doors and disturbing drones'},
     { name: 'sewer',        url: 'https://www.youtube.com/watch?v=9QZ_2wKbb5o', volume: 0.39, description: 'Water and rats'},
     { name: 'tavern_thieves', url: 'https://www.youtube.com/watch?v=Ag8sbpNXBEQ', volume: 0.49, description: 'Poisons, contracts, and mercenaries gather'},
@@ -1022,6 +1216,7 @@ const RESOURCE_ELEMENTS = [
     { name: 'blizzard_light', url: 'https://www.youtube.com/watch?v=RhvyGiJs120', volume: 0.46, description: 'Cold winds echo across the icy valley floor'},
     { name: 'fire',         url: 'https://www.youtube.com/watch?v=2ya2drfb4rA', volume: 0.52, description: 'Building on fire'},
     { name: 'fog_of_war',   url: 'https://www.youtube.com/watch?v=fbUsBAocY1o', volume: 0.46, description: 'Eerie stretched sounds'},
+    { name: 'heavenly',     url: 'https://www.youtube.com/watch?v=RG1ydqEEa0c', volume: 0.5, description: 'Divine echoing voices'},
     { name: 'hellish',      url: 'https://www.youtube.com/watch?v=JzVIkY5tKcE', volume: 0.5, description: 'Evil and haunting screams'},
     { name: 'rain',         url: 'https://www.youtube.com/watch?v=KSSpVMIgN2Y', volume: 0.52, description: 'Persistent showers'},
     { name: 'sandstorm',    url: 'https://www.youtube.com/watch?v=2pP7orLxU4U', volume: 0.38, description: 'Biting winds and sand'},
@@ -1032,3 +1227,65 @@ const RESOURCE_ELEMENTS = [
     { name: 'winds_nature', url: 'https://www.youtube.com/watch?v=7WPsftkv1ZY', volume: 0.65, description: 'Soothing forest winds'},
     { name: 'winds_elevated', url: 'https://www.youtube.com/watch?v=oy0jX_I1CIU', volume: 0.59, description: 'Heavy, stable winds'},
 ]
+
+const RESOURCE_TRAVEL = [
+    { name: 'airship_interior', url: 'https://www.youtube.com/watch?v=u_aQjdL3Y-o', volume: 0.5, description: ''},
+    { name: 'airship_sailing', url: 'https://www.youtube.com/watch?v=q262bXKBUOw', volume: 0.5, description: ''},
+    { name: 'caravan_night', url: 'https://www.youtube.com/watch?v=96w92SOj3e8', volume: 0.42, description: ''},
+    { name: 'ship_interior', url: 'https://www.youtube.com/watch?v=7JZ4uBJLJ60', volume: 0.47, description: ''},
+    { name: 'ship_sailing', url: 'https://www.youtube.com/watch?v=beOw8MEojQ4', volume: 0.43, description: ''},
+    { name: 'ship_storm', url: 'https://www.youtube.com/watch?v=ZNz7yFEHtDs', volume: 0.42, description: ''},
+    { name: 'horse_and_cart', url: 'https://www.youtube.com/watch?v=2UnwwWvqYIc', volume: 0.47, description: ''},
+    { name: 'horseback_travel', url: 'https://www.youtube.com/watch?v=49TLUjcIWYI', volume: 0.48, description: ''},
+]
+
+enum DiceModifiers {
+    Advantage = 1,
+    Disadvantage = 2,
+    DropN = 3,
+}
+
+class SoundsmithDiceRoller {
+    public constructor() {}
+
+    public static commandRollRegular(dieValue: number, numOfDice: number): { diceValues: number[], result: number } {
+        const results = SoundsmithDiceRoller.roll(dieValue, numOfDice);
+        const total = results.reduce((partialSum, a) => partialSum + a, 0);
+        return { diceValues: results, result: total };
+    }
+
+    public static commandRollWithModifier(dieValue: number, diceModifierEnum: number, dropCount: number | null, numOfDice?: number): { diceValues: number[], result: number, dropped: number[] | null } {
+        // Roll the specified number of times -- default twice if unspecified. 
+        const results = this.roll(dieValue, numOfDice && numOfDice > 1 ? numOfDice : 2);
+
+        let total = 0;
+        let dropped: number[] = [];
+        if (diceModifierEnum == DiceModifiers.Advantage) {
+            total = Math.max(...results);
+            console.log('Rolling with advantage.');
+        } else if (diceModifierEnum == DiceModifiers.Disadvantage) {
+            total = Math.min(...results);
+            console.log('Rolling with disadvantage.');
+        } else if (diceModifierEnum = DiceModifiers.DropN) {
+            let sortedResults = [...results];
+            sortedResults.sort(function(a, b){return a - b})
+            for (let i = dropCount ?? 1; i < results.length; i++) {
+                total += sortedResults[i];
+            }
+        }
+
+        console.log(`Rolling with: ${diceModifierEnum} -> ${results}: Result: ${total}`);
+
+        return { diceValues: results, result: total, dropped: dropped.length > 0 ? dropped : null };
+    }
+
+    private static roll(dieValue: number, numOfDice: number): number[] {
+        let results: number[] = [];
+
+        for (let i = 0; i < numOfDice; i++) {
+            results.push(Math.floor(Math.random() * (dieValue) + 1));
+        }
+
+        return results;
+    }
+}

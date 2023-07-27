@@ -56,7 +56,18 @@ class SoundsmithConnection {
         this.queue = [];
         this.currentObject = null;
 
+        const networkStateChangeHandler = (oldNetworkState: any, newNetworkState: any) => {
+            const newUdp = Reflect.get(newNetworkState, 'udp');
+            clearInterval(newUdp?.keepAliveInterval);
+        }
+
         this.voiceConnection.on('stateChange', async (_oldState: any, newState: any) => {
+            const oldNetworking = Reflect.get(_oldState, 'networking');
+            const newNetworking = Reflect.get(newState, 'networking');
+
+            oldNetworking?.off('stateChange', networkStateChangeHandler);
+            newNetworking?.on('stateChange', networkStateChangeHandler);
+
             if (newState.status === VoiceConnectionStatus.Disconnected) {
                 if (newState.reason === VoiceConnectionDisconnectReason.WebSocketClose && newState.closeCode === 4014) {
                     /**
@@ -278,7 +289,10 @@ class SoundsmithConnection {
         // Return if the queue is empty and there's no repeating or looping track.
         if (this.queue.length === 0 && (!this.currentObject || !(this.playbackFlags.loop || this.playbackFlags.repeat))) 
             return;
-        
+        // When skipping a track in loop or repeat mode, do nothing if there would be no more tracks.
+        if (this.queue.length === 0 && (this.playbackFlags.loop || this.playbackFlags.repeat) && this.skippedSong)
+            return;
+
         this.queueLock = true; // Lock the queue to guarantee safe access
 
         let nextTrack: SoundObject;
@@ -290,7 +304,7 @@ class SoundsmithConnection {
             // Take the first item from the queue. This is guaranteed to exist, due to the non-empty check above.
             nextTrack = this.queue.shift()!;
 
-            if (this.playbackFlags.loop && this.currentObject) {
+            if (this.playbackFlags.loop && this.currentObject && !this.skippedSong) {
                 // Add the track back to a random position in the queue (biased toward further locations) if shuffle is enabled.
                 this.playbackFlags.shuffle ? this.enqueueShuffled(this.currentObject) : this.enqueue(this.currentObject);
                 console.log(`Adding song to the end: ${this.currentObject.title}`);

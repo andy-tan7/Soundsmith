@@ -286,8 +286,10 @@ class SoundsmithConnection {
         if (this.queueLock || this.audioPlayer.state.status !== AudioPlayerStatus.Idle) 
             return;
         
-        // Return if the queue is empty and there's no repeating or looping track.
-        if (this.queue.length === 0 && (!this.currentObject || !(this.playbackFlags.loop || this.playbackFlags.repeat))) 
+        // Return if the queue is empty and there's no repeating or looping track to automatically re-add.
+        if (this.queue.length === 0 && !this.currentObject)
+            return;
+        if (this.queue.length === 0 && !this.playbackFlags.loop && !this.playbackFlags.repeat)
             return;
         // When skipping a track in loop or repeat mode, do nothing if there would be no more tracks.
         if (this.queue.length === 0 && (this.playbackFlags.loop || this.playbackFlags.repeat) && this.skippedSong)

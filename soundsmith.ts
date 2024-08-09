@@ -18,6 +18,8 @@ import {
 } from '@discordjs/voice';
 import { Interaction, Client, GuildMember, CommandInteraction, ApplicationCommandData, ApplicationCommandOptionData, ApplicationCommandOptionChoiceData } from 'discord.js';
 import playdl, { YouTubeVideo } from 'play-dl';
+//import ytdl from 'ytdl-core';
+import ytdl from "@distube/ytdl-core";
 import dotenv from 'dotenv';
 import { promisify } from 'node:util';
 
@@ -374,8 +376,10 @@ class SoundObject implements SoundObjectData {
     }
 
     public async createAudioResource() {
-        const source = await playdl.stream(this.url, { discordPlayerCompatibility: true });
-        return createAudioResource(source.stream, { metadata: this, inputType: source.type, inlineVolume: true });
+        //const source = await playdl.stream(this.url, { discordPlayerCompatibility: true });
+        const source = ytdl(this.url, { filter: "audioonly", liveBuffer: 0, quality: "lowestaudio" });
+        //return createAudioResource(source.stream, { metadata: this, inputType: source.type, inlineVolume: true });
+        return createAudioResource(source, { metadata: this, inlineVolume: true });
     }
 
     public getTimeHMS() {

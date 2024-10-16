@@ -17,7 +17,10 @@
     "dotenv": "^16.0.3",
     "ffmpeg-static": "^5.1.0",
     "libsodium-wrappers": "^0.7.11",
-    "node": "^22.6.0",
-    "play-dl": "^1.9.7"
+    "node": "^22.9.0",
+    "node-opus": "^0.3.3",
+    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7",
+    "ytdl-core": "^4.11.5"
   }
 }
